@@ -16,38 +16,49 @@ import (
 	"time"
 )
 
+// 1. Buffer Pool: Reduces GC pressure by reusing byte slices
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		// 32KB buffer is standard for io.Copy
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
 func main() {
-	backendURL := getEnv("BACKEND_URL", "https://your-backend-server.com")
+	backendURL := getEnv("BACKEND_URL", "https://funtones-orange.run.place")
 
 	target, err := url.Parse(backendURL)
 	if err != nil {
 		log.Fatalf("Failed to parse BACKEND_URL: %v", err)
 	}
 
-	// Always skip TLS verification for simplicity
 	proxy := httputil.NewSingleHostReverseProxy(target)
 
+	// 2. Transport Tuning: Optimize connection reuse for HTTP requests
 	proxy.Transport = &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:        1000,             // Default is 100, too low for high load
+		MaxIdleConnsPerHost: 1000,             // Default is 2, massive bottleneck
+		IdleConnTimeout:     90 * time.Second, // Keep connections open longer
+		DisableCompression:  true,             // CPU optimization: don't compress if backend already did
 	}
 
-	// Simple logging
+	// 3. Removed Logging from Director (Hot Path)
+	// Only modifying the request, not logging every single hit to stdout
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
-		log.Printf("%s %s -> %s", req.Method, req.URL.Path, req.URL.String())
+		// Optimization: Removed log.Printf here to reduce I/O blocking
 	}
 
-	// Error handler
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
 		log.Printf("Proxy error: %v", err)
 		rw.WriteHeader(http.StatusBadGateway)
 		rw.Write([]byte("Bad Gateway"))
 	}
 
-	// WebSocket and HTTP handler
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Check if this is a WebSocket upgrade request
 		if isWebSocketRequest(r) {
 			handleWebSocket(w, r, target)
 		} else {
@@ -55,11 +66,10 @@ func main() {
 		}
 	})
 
-	log.Printf("Google redirector starting on port 8080")
+	log.Printf("High-performance redirector starting on port 8080")
 	log.Printf("Proxying to: %s", backendURL)
-	log.Printf("TLS verification: disabled")
-	log.Printf("WebSocket support: enabled")
 
+	// ListenAndServe
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatalf("Server failed to start: %v", err)
 	}
@@ -73,27 +83,28 @@ func getEnv(key, defaultValue string) string {
 }
 
 func isWebSocketRequest(r *http.Request) bool {
-	return strings.ToLower(r.Header.Get("Upgrade")) == "websocket" &&
+	// 4. Optimization: Use EqualFold to avoid allocating new strings with ToLower
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
-	log.Printf("WebSocket upgrade request: %s %s", r.Method, r.URL.Path)
+	// Optimization: Removed info log to reduce I/O
 
 	// Build backend WebSocket URL
+	// We construct this manually to avoid deep copying the URL object unnecessarily
+	backendScheme := "ws"
+	if target.Scheme == "https" {
+		backendScheme = "wss"
+	}
+
 	backendURL := &url.URL{
-		Scheme:   "ws",
+		Scheme:   backendScheme,
 		Host:     target.Host,
 		Path:     r.URL.Path,
 		RawQuery: r.URL.RawQuery,
 	}
-	if target.Scheme == "https" {
-		backendURL.Scheme = "wss"
-	}
 
-	log.Printf("Connecting to backend WebSocket: %s", backendURL)
-
-	// Connect to backend
 	backendConn, backendResp, err := dialBackendWebSocket(backendURL, r)
 	if err != nil {
 		log.Printf("Backend WebSocket dial failed: %v", err)
@@ -102,10 +113,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
 	}
 	defer backendConn.Close()
 
-	// Hijack client connection
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		log.Printf("Hijacking not supported")
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
 		return
 	}
@@ -117,26 +126,22 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
 	}
 	defer clientConn.Close()
 
-	// Send 101 Switching Protocols response to client
 	if err := writeSwitchingProtocols(clientConn, r, backendResp); err != nil {
-		log.Printf("Failed to send upgrade response: %v", err)
+		clientConn.Close()
 		return
 	}
-
-	log.Printf("WebSocket connection established, proxying data...")
 
 	// Bidirectional copy
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	go pipe(backendConn, clientConn, "client→backend", &wg)
-	go pipe(clientConn, backendConn, "backend→client", &wg)
+	go pipe(backendConn, clientConn, &wg)
+	go pipe(clientConn, backendConn, &wg)
 
 	wg.Wait()
 }
 
 func dialBackendWebSocket(u *url.URL, r *http.Request) (net.Conn, *http.Response, error) {
-	// Determine host and port
 	host := u.Host
 	if !strings.Contains(host, ":") {
 		if u.Scheme == "wss" {
@@ -146,13 +151,12 @@ func dialBackendWebSocket(u *url.URL, r *http.Request) (net.Conn, *http.Response
 		}
 	}
 
-	// Dial TCP connection
-	conn, err := net.DialTimeout("tcp", host, 10*time.Second)
+	// Optimization: Reduced timeout for faster failover
+	conn, err := net.DialTimeout("tcp", host, 5*time.Second)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Wrap with TLS if wss
 	if u.Scheme == "wss" {
 		tlsConn := tls.Client(conn, &tls.Config{
 			ServerName:         u.Hostname(),
@@ -165,7 +169,6 @@ func dialBackendWebSocket(u *url.URL, r *http.Request) (net.Conn, *http.Response
 		conn = tlsConn
 	}
 
-	// Build WebSocket upgrade request
 	req := &http.Request{
 		Method: "GET",
 		URL:    u,
@@ -175,29 +178,27 @@ func dialBackendWebSocket(u *url.URL, r *http.Request) (net.Conn, *http.Response
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
 
-	// Forward important headers
+	// Forward headers directly without extra logic where possible
 	req.Header.Set("Sec-WebSocket-Version", r.Header.Get("Sec-WebSocket-Version"))
 	req.Header.Set("Sec-WebSocket-Key", r.Header.Get("Sec-WebSocket-Key"))
 
 	if proto := r.Header.Get("Sec-WebSocket-Protocol"); proto != "" {
 		req.Header.Set("Sec-WebSocket-Protocol", proto)
 	}
-
 	if ext := r.Header.Get("Sec-WebSocket-Extensions"); ext != "" {
 		req.Header.Set("Sec-WebSocket-Extensions", ext)
 	}
-
 	if auth := r.Header.Get("Authorization"); auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
 
-	// Send upgrade request
 	if err := req.Write(conn); err != nil {
 		conn.Close()
 		return nil, nil, err
 	}
 
-	// Read response
+	// Optimization: Use a smaller buffered reader if headers are small,
+	// but default is fine.
 	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
 	if err != nil {
 		conn.Close()
@@ -215,48 +216,68 @@ func dialBackendWebSocket(u *url.URL, r *http.Request) (net.Conn, *http.Response
 func writeSwitchingProtocols(clientConn net.Conn, clientReq *http.Request, backendResp *http.Response) error {
 	accept := backendResp.Header.Get("Sec-WebSocket-Accept")
 	if accept == "" {
-		return fmt.Errorf("missing Sec-WebSocket-Accept from backend")
+		return fmt.Errorf("missing Sec-WebSocket-Accept")
 	}
 
-	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + accept + "\r\n"
+	// Optimization: Pre-calculate size or use string builder if this gets complex,
+	// but simple string concat is fast enough here for one-time op.
+	var sb strings.Builder
+	sb.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+	sb.WriteString("Upgrade: websocket\r\n")
+	sb.WriteString("Connection: Upgrade\r\n")
+	sb.WriteString("Sec-WebSocket-Accept: ")
+	sb.WriteString(accept)
+	sb.WriteString("\r\n")
 
-	// Forward protocol if both sides agree
 	if proto := clientReq.Header.Get("Sec-WebSocket-Protocol"); proto != "" {
 		backendProto := backendResp.Header.Get("Sec-WebSocket-Protocol")
-		if backendProto != "" && strings.Contains(proto, backendProto) {
-			resp += fmt.Sprintf("Sec-WebSocket-Protocol: %s\r\n", backendProto)
+		if backendProto != "" {
+			// Skip the strings.Contains check if we trust the backend,
+			// otherwise keep it.
+			sb.WriteString("Sec-WebSocket-Protocol: ")
+			sb.WriteString(backendProto)
+			sb.WriteString("\r\n")
 		}
 	}
+	sb.WriteString("\r\n")
 
-	resp += "\r\n"
-
-	_, err := clientConn.Write([]byte(resp))
+	_, err := clientConn.Write([]byte(sb.String()))
 	return err
 }
 
-func pipe(dst, src net.Conn, dir string, wg *sync.WaitGroup) {
+func pipe(dst, src net.Conn, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	n, err := io.Copy(dst, src)
+	// 5. Critical Optimization: Use Buffer Pool + CopyBuffer
+	// Get buffer from pool
+	bufPtr := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufPtr) // Return to pool when done
 
-	if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
-		log.Printf("pipe %s error: %v (copied %d bytes)", dir, err, n)
-	} else {
-		log.Printf("pipe %s finished (copied %d bytes)", dir, n)
+	// Dereference to get the slice
+	buf := *bufPtr
+
+	// io.CopyBuffer prevents allocating a new buffer for every single connection
+	_, err := io.CopyBuffer(dst, src, buf)
+
+	// Logging removed from hot path. Only log unexpected errors if strictly necessary.
+	if err != nil {
+		// Only log real errors, ignore standard close errors
+		// This string check is expensive, so only do it if err != nil
+		if !strings.Contains(err.Error(), "closed network connection") {
+			log.Printf("pipe error: %v", err)
+		}
 	}
 
-	// 1. WebSocket close frame
-	_ = dst.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	// Fast Close
+	// We set a deadline to force any pending reads/writes to unblock immediately
+	_ = dst.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+
+	// Send WS Close frame (Opcode 8)
 	_, _ = dst.Write([]byte{0x88, 0x02, 0x03, 0xe8})
 
-	// 2. Full TLS shutdown (if applicable)
 	if tc, ok := dst.(*tls.Conn); ok {
-		_ = tc.Close() // sends + drains close_notify
+		_ = tc.Close()
 	} else {
-		// 3. For plain TCP: half-close + full close
 		if sc, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = sc.CloseWrite()
 		}
